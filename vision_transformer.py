@@ -474,17 +474,21 @@ class VisionTransformer(nn.Module):
             self.total_prompt_len = res['total_prompt_len']
             x = res['prompted_embedding']
             
-            if task_level_pos_text is not None:
-                pos_loss = self.text_supervised_loss(res['selected_key'], task_level_pos_text)
-                task_pos_loss = torch.sum(pos_loss) / pos_loss.shape[0]
+            if task_level_pos_text is not None and task_id > 0:
+                pos_loss = self.text_supervised_loss(res['selected_key'], task_level_pos_text) # (b n_prompt, c) (b c) ｜ 16 5
+                print('pos task loss', torch.mean(pos_loss))
+                task_pos_loss = torch.sum(pos_loss) / (pos_loss.shape[0] * pos_loss.shape[1])
                 
-                res['task_loss'] = 1 - task_pos_loss
-                print('pos task loss', res['task_loss'])
+                neg_loss = 0
                 if task_level_neg_text is not None:
                     neg_loss = self.text_supervised_loss(res['selected_key'], task_level_neg_text)
-                    task_neg_loss = torch.sum(neg_loss) / neg_loss.shape[0]
-                    res['task_loss'] += task_neg_loss
-                    print('neg task loss', task_neg_loss)
+                    task_neg_loss = torch.sum(neg_loss) / (neg_loss.shape[0] * neg_loss.shape[1])
+                    print('neg task loss', torch.mean(neg_loss))
+
+                # trible_loss = 1 - pos_loss + neg_loss
+                #res['task_loss'] = torch.sum(trible_loss) / (trible_loss.shape[0] * trible_loss.shape[1])
+                res['task_loss'] = 1 - task_pos_loss + task_neg_loss
+                print('task level trible loss ', res['task_loss'])
         else:
             res=dict()
         if self.cls_token is not None:
@@ -520,22 +524,21 @@ class VisionTransformer(nn.Module):
             raise ValueError(f'Invalid classifier={self.classifier}')
         
         res['pre_logits'] = x
-
         x = self.fc_norm(x)
-        if class_level_pos_text is not None:
-            pos_loss = self.text_supervised_loss(x, class_level_pos_text)
-            class_pos_loss = torch.sum(pos_loss) / pos_loss.shape[0]
+        if class_level_pos_text is not None and class_level_neg_text is not None:
+            class_pos_loss = self.text_supervised_loss(x, class_level_pos_text)
+            class_pos_loss = torch.sum(class_pos_loss) / class_pos_loss.shape[0]
+            print('pos class loss', class_pos_loss)
             
-            res['class_loss'] = 1 - class_pos_loss
-            print('pos class loss', res['class_loss'])
-            if class_level_neg_text is not None:
-                neg_loss = self.text_supervised_loss(x, class_level_neg_text)
-                class_neg_loss = torch.sum(pos_loss) / neg_loss.shape[0]
-                res['class_loss'] += class_neg_loss
-                print('neg class loss', class_neg_loss)
+            class_neg_loss = self.text_supervised_loss(x, class_level_neg_text)
+            class_neg_loss = torch.sum(class_neg_loss) / class_neg_loss.shape[0]
+
+            print('neg class loss', class_neg_loss)
+            # triple_loss = 1 - class_pos_loss + class_neg_loss
+            # res['class_loss'] = torch.sum(triple_loss) / triple_loss.shape[0]
+            res['class_loss'] = 1 - class_pos_loss + class_neg_loss
         
         res['logits'] = self.head(x)
-        
         return res
 
     def forward(self, x, task_id=-1, cls_features=None, train=False,
@@ -548,9 +551,9 @@ class VisionTransformer(nn.Module):
     
     def text_supervised_loss(self, selected_key, text_feature):
         if len(selected_key.shape) > 2:
-            text_feature = text_feature.unsqueeze(1).repeat(1,selected_key.shape[1],1)
-        
-        return self.cos(selected_key,text_feature)
+            text_feature = text_feature.unsqueeze(1)
+       # print(f'selected key: {selected_key.shape}, text_feature {text_feature.shape}')
+        return F.cosine_similarity(selected_key,text_feature,dim=-1)
 
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """

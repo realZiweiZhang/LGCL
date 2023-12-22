@@ -89,6 +89,9 @@ def main(args):
         for n, p in model.named_parameters():
             if n.startswith(tuple(args.freeze)):
                 p.requires_grad = False
+                
+        for p in clip_model.parameters():
+            p.requires_grad = False
 
     print(args)
 
@@ -111,7 +114,7 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
         
         model_without_ddp = model.module
     

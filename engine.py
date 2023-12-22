@@ -20,15 +20,18 @@ from pathlib import Path
 import torch
 
 import numpy as np
-
+import torch.nn.functional as F
 from timm.utils import accuracy
 from timm.optim import create_optimizer
 
 import clip
 import utils
 import random
+
 def create_text(class_names):
     task_level_info = 'a photo of'
+    if isinstance(class_names,str):
+        class_names = [class_names] 
     for i, name in enumerate(class_names):
         if i == 0:
             icre_info = ' '+str(name)
@@ -37,13 +40,12 @@ def create_text(class_names):
         task_level_info += icre_info
     return task_level_info
 
-def create_name_feature(clip_model, name, device):
-    text = clip.tokenize(create_text(class_names=name)).to(device)
+def create_feature(clip_model, text, device):
+    text = clip.tokenize(text).to(device)
     return clip_model.encode_text(text)
 
 def selecte_class_neg_sample(class_names, task_id):
     assert task_id > 0
-    
     valid_class_names = class_names[:task_id]
 
     rdm_task_idx = random.randint(0,len(valid_class_names)-1)
@@ -64,58 +66,59 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('Lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('basic_Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    if task_id > 0:
+        metric_logger.add_meter('class_Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+        metric_logger.add_meter('task_Loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = f'Train: Epoch[{epoch+1:{int(math.log10(args.epochs))+1}}/{args.epochs}]'
     
-    if args.use_text_encoder:
+    task_level_pos_feature, task_level_neg_feature = None, None
+    if args.use_text_encoder and original_model is not None:
         pos_class_names = class_names[task_id]
-                    
-        # task_level_text = clip.tokenize(create_text(class_names=pos_class_names)).to(model.device)
-        # task_level_pos_feature = clip_model.encode_text(task_level_text)
-        task_level_pos_feature = create_name_feature(clip_model, pos_class_names,model.device)
+        
+        task_level_pos_name = create_text(class_names=pos_class_names)
+        task_level_pos_feature = create_feature(clip_model, task_level_pos_name, model.device)
+        
         task_level_neg_feature = None
         if task_id > 0:
+            task_level_neg_feature = []
             random_neg_id = random.randint(0, task_id-1)
-            task_level_neg_feature = clip_model.encode_text(clip.tokenize(create_text(class_names=class_names[random_neg_id])).to(model.device))
             
+            task_level_neg_name = create_text(class_names=class_names[random_neg_id])
+            task_level_neg_feature = create_feature(clip_model, task_level_neg_name, model.device)
+            # task_level_neg_feature = clip_model.encode_text(clip.tokenize(task_neg_name).to(model.device))
     for input_list in metric_logger.log_every(data_loader, args.print_freq, header):
         input = input_list[0].to(device, non_blocking=True)
         target = input_list[1].to(device, non_blocking=True)
         
         name = input_list[2] if args.use_text_encoder else None
 
-        # task_level_pos_feature, task_level_neg_feature = None, None
         class_level_pos_feature, class_level_neg_feature = None, None
         with torch.no_grad():
             if original_model is not None:
                 output = original_model(input)
                 cls_features = output['pre_logits']
                 
-                if class_names and name is not None:
-                    class_level_text = clip.tokenize(create_text(class_names=name))
-                    class_level_pos_feature = clip_model.encode_text(class_level_text.to(model.device))
-                    
-                    # neg_name_list = []
-                    # for batch_name in name:
-                    #     remove_pos_name = list(pos_class_names)
-                    #     remove_pos_name.pop(pos_class_names.index(batch_name))
-                    #     neg_name_id = random.randint(0,len(remove_pos_name)-1)
-                    #     neg_name_list.append(remove_pos_name[neg_name_id])
-                    # class_level_neg_feature = clip_model.encode_text(clip.tokenize(create_text(class_names=neg_name_list)).to(model.device))
-                    if task_id > 0:
-                        neg_class_name = selecte_class_neg_sample(class_names,task_id)
-                        class_level_neg_feature = create_name_feature(clip_model, neg_class_name,model.device)
-                        assert class_level_neg_feature is not None
+                if task_id > 0 and name is not None and class_names is not None:
+                    class_pos_name = list(map(create_text, name))
+
+                    class_level_pos_feature = torch.zeros((len(name),cls_features.shape[1]))
+                    for i, pos_name in enumerate(class_pos_name):
+                        class_level_pos_feature[i] = create_feature(clip_model, pos_name, model.device)
+
+                    neg_class = selecte_class_neg_sample(class_names,task_id)
+                    class_level_neg_name = create_text(neg_class)
+                    # print('class_level_neg_name', class_level_neg_name)
+                    class_level_neg_feature = create_feature(clip_model, class_level_neg_name,model.device)    
             else:
                 cls_features = None
-                
 
         
         output = model(input, task_id=task_id, cls_features=cls_features, train=set_training_mode, 
                        task_level_pos_text=task_level_pos_feature, task_level_neg_text=task_level_neg_feature,
                        class_level_pos_text=class_level_pos_feature, class_level_neg_text=class_level_neg_feature)
         logits = output['logits']
-
+        
         # here is the trick to mask out classes of non-current tasks
         if args.train_mask and class_mask is not None:
             mask = class_mask[task_id]
@@ -125,11 +128,17 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
 
         loss = criterion(logits, target) # base criterion (CrossEntropyLoss)
         if args.pull_constraint and 'reduce_sim' in output:
-            loss = loss - args.pull_constraint_coeff * output['reduce_sim']
+            basic_loss = loss - args.pull_constraint_coeff * output['reduce_sim']
 
-        if 'class_loss' in output and 'task_loss' in output:
-            loss += (output['class_loss'] + output['task_loss']) * 0.5
-            
+        task_loss, class_loss = torch.zeros_like(loss), torch.zeros_like(loss)
+        
+        if task_id > 0:
+            if 'class_loss' in output or 'task_loss' in output:
+                # task_loss = output['task_loss']
+                # class_loss = output['class_loss']
+                total_loss = basic_loss + task_loss + class_loss
+        else:
+            total_loss = basic_loss
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
 
         if not math.isfinite(loss.item()):
@@ -137,16 +146,23 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
             sys.exit(1)
 
         optimizer.zero_grad()
-        loss.backward(retain_graph=True) 
+        total_loss.backward(retain_graph=True) 
+        # for name, parms in model.named_parameters():	
+        #     print('-->name:', name, '-->grad_requirs:',parms.requires_grad, \
+		#     ' -->grad_value:',parms.grad)
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
 
         torch.cuda.synchronize()
-        metric_logger.update(Loss=loss.item())
+        metric_logger.update(basic_Loss=basic_loss.item())
         metric_logger.update(Lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters['Acc@1'].update(acc1.item(), n=input.shape[0])
         metric_logger.meters['Acc@5'].update(acc5.item(), n=input.shape[0])
         
+        if task_id > 0:
+            metric_logger.update(task_Loss=task_loss.item())
+            metric_logger.update(class_Loss=class_loss.item())
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -299,7 +315,6 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
             
             if lr_scheduler:
                 lr_scheduler.step(epoch)
-
         test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
         if args.output_dir and utils.is_main_process():
