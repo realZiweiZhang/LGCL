@@ -18,7 +18,7 @@ from typing import Iterable
 from pathlib import Path
 
 import torch
-
+import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
 from timm.utils import accuracy
@@ -29,7 +29,7 @@ import utils
 import random
 
 def create_text(class_names):
-    task_level_info = 'a photo of'
+    task_level_info = 'A photo of'
     if isinstance(class_names,str):
         class_names = [class_names] 
     for i, name in enumerate(class_names):
@@ -38,6 +38,7 @@ def create_text(class_names):
         else:
             icre_info = ' '+'or'+' '+str(name)
         task_level_info += icre_info
+    task_level_info = task_level_info + "."
     return task_level_info
 
 def create_feature(clip_model, text, device):
@@ -51,11 +52,33 @@ def selecte_class_neg_sample(class_names, task_id):
     rdm_task_idx = random.randint(0,len(valid_class_names)-1)
     rdm_class_idx = random.randint(0,len(valid_class_names[0])-1)
     return class_names[rdm_task_idx][rdm_class_idx]
+
+def prompt_visualization(count_n, vis_task_id, png_name:str=None):
+    assert vis_task_id is not None, 'task ids are not inputed' 
+    assert len(count_n) == len(vis_task_id), 'the dimensions are not equal'
     
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    task_n = len(vis_task_id)
+    color = [plt.cm.tab20(2*i) for i in range(task_n)]
+    
+    xs = np.arange(10)
+    zs = [i for i in range(task_n)]
+    for id, (c, z) in enumerate(zip(color, zs)):
+        ys = count_n[id]
+        cs = [c] * len(xs)
+        ax.bar(xs, ys, zs=z, zdir='y', color=cs)
+
+    png_name = ('png_name'+'.png') if png_name else 'visual.png'
+    plt.savefig(png_name)
+    # plt.show()
+   
 def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, clip_model: torch.nn.Module,
                     criterion, data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    set_training_mode=True, task_id=-1, class_mask=None, class_names=None, args = None,):
+                    set_training_mode=True, task_id=-1, class_mask=None, class_names=None, args = None,
+                    task_level_features=None):
 
     model.train(set_training_mode)
     original_model.eval()
@@ -74,19 +97,22 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
     
     task_level_pos_feature, task_level_neg_feature = None, None
     if args.use_text_encoder and original_model is not None:
-        pos_class_names = class_names[task_id]
+        if task_level_features is not None:
+            task_level_pos_feature = task_level_features[-1]
+            task_level_neg_feature = task_level_features[:-1]
+        # pos_class_names = class_names[task_id]
         
-        task_level_pos_name = create_text(class_names=pos_class_names)
-        task_level_pos_feature = create_feature(clip_model, task_level_pos_name, model.device)
+        # task_level_pos_name = create_text(class_names=pos_class_names)
+        # task_level_pos_feature = create_feature(clip_model, task_level_pos_name, model.device)
         
-        task_level_neg_feature = None
-        if task_id > 0:
-            task_level_neg_feature = []
-            random_neg_id = random.randint(0, task_id-1)
-            
-            task_level_neg_name = create_text(class_names=class_names[random_neg_id])
-            task_level_neg_feature = create_feature(clip_model, task_level_neg_name, model.device)
-            # task_level_neg_feature = clip_model.encode_text(clip.tokenize(task_neg_name).to(model.device))
+        # task_level_neg_feature = None
+        # if task_id > 0:
+        #     task_level_neg_feature = []
+        #     random_neg_id = random.randint(0, task_id-1) 
+        #     task_level_neg_name = create_text(class_names=class_names[random_neg_id])
+        #     task_level_neg_feature = create_feature(clip_model, task_level_neg_name, model.device)
+        #     # task_level_neg_feature = clip_model.encode_text(clip.tokenize(task_neg_name).to(model.device))
+    prompt_id = []
     for input_list in metric_logger.log_every(data_loader, args.print_freq, header):
         input = input_list[0].to(device, non_blocking=True)
         target = input_list[1].to(device, non_blocking=True)
@@ -118,6 +144,7 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
                        task_level_pos_text=task_level_pos_feature, task_level_neg_text=task_level_neg_feature,
                        class_level_pos_text=class_level_pos_feature, class_level_neg_text=class_level_neg_feature)
         logits = output['logits']
+        prompt_id.extend(output['prompt_idx'].flatten().tolist())
         
         # here is the trick to mask out classes of non-current tasks
         if args.train_mask and class_mask is not None:
@@ -131,11 +158,11 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
             basic_loss = loss - args.pull_constraint_coeff * output['reduce_sim']
 
         task_loss, class_loss = torch.zeros_like(loss), torch.zeros_like(loss)
-        
+        total_loss = basic_loss
         if task_id > 0:
             if 'class_loss' in output or 'task_loss' in output:
-                # task_loss = output['task_loss']
-                # class_loss = output['class_loss']
+                task_loss = output['task_loss']
+                class_loss = output['class_loss']
                 total_loss = basic_loss + task_loss + class_loss
         else:
             total_loss = basic_loss
@@ -166,7 +193,9 @@ def train_one_epoch(model: torch.nn.Module, original_model: torch.nn.Module, cli
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    metric_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    metric_dict['prompt_ids'] = np.bincount(prompt_id,minlength=10)
+    return metric_dict
 
 
 @torch.no_grad()
@@ -180,13 +209,11 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
     # switch to evaluation mode
     model.eval()
     original_model.eval()
-
     with torch.no_grad():
+        prompt_ids = []
         for input, target in metric_logger.log_every(data_loader, args.print_freq, header):
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-
-            # compute output
 
             if original_model is not None:
                 output = original_model(input)
@@ -196,6 +223,7 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
             
             output = model(input, task_id=task_id, cls_features=cls_features)
             logits = output['logits']
+            prompt_ids.extend(output['prompt_idx'].flatten().tolist())
 
             if args.task_inc and class_mask is not None:
                 #adding mask to output logits
@@ -218,7 +246,9 @@ def evaluate(model: torch.nn.Module, original_model: torch.nn.Module, data_loade
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.meters['Acc@1'], top5=metric_logger.meters['Acc@5'], losses=metric_logger.meters['Loss']))
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    metric_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    metric_dict['prompt_ids'] = np.bincount(prompt_ids,minlength=10)
+    return metric_dict
 
 
 @torch.no_grad()
@@ -226,6 +256,8 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
                     device, task_id=-1, class_mask=None, acc_matrix=None, args=None,):
     stat_matrix = np.zeros((3, args.num_tasks)) # 3 for Acc@1, Acc@5, Loss
 
+    acc_for_each_task = []
+    total_id = []
     for i in range(task_id+1):
         test_stats = evaluate(model=model, original_model=original_model, data_loader=data_loader[i]['val'], 
                             device=device, task_id=i, class_mask=class_mask, args=args)
@@ -236,6 +268,11 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
 
         acc_matrix[i, task_id] = test_stats['Acc@1']
     
+        acc_for_each_task.append(test_stats['Acc@1'])
+        
+        total_id.append(test_stats['prompt_ids'])
+        test_stats['prompt_ids'] = str(test_stats['prompt_ids'])
+        
     avg_stat = np.divide(np.sum(stat_matrix, axis=1), task_id+1)
 
     diagonal = np.diag(acc_matrix)
@@ -248,6 +285,10 @@ def evaluate_till_now(model: torch.nn.Module, original_model: torch.nn.Module, d
 
         result_str += "\tForgetting: {:.4f}\tBackward: {:.4f}".format(forgetting, backward)
     print(result_str)
+    test_stats['acc_all'] = acc_for_each_task
+    test_stats['avg_res'] = str(result_str)
+    
+    prompt_visualization(total_id, range(task_id+1),'test_'+str(task_id))
 
     return test_stats
 
@@ -257,7 +298,8 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
 
     # create matrix to save end-of-task accuracies 
     acc_matrix = np.zeros((args.num_tasks, args.num_tasks))
-
+    prompt_his = []
+    task_level_texts = []
     for task_id in range(args.num_tasks):
        # Transfer previous learned prompt params to the new prompt
         if args.prompt_pool and args.shared_prompt_pool:
@@ -307,14 +349,29 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
         if task_id > 0 and args.reinit_optimizer:
             optimizer = create_optimizer(args, model)
         
+        task_level_feature = None
+        if args.use_text_encoder:
+            with torch.no_grad():
+                cur_task_classes = class_names[task_id]
+                text = "A photo of "+cur_task_classes[0]
+                for i in range(1,len(cur_task_classes)):
+                    text = text + " or " +cur_task_classes[i]
+                task_level_texts.append(text+".")
+            task_level_tokens = clip.tokenize(task_level_texts).cuda()
+            task_level_feature = clip_model.encode_text(task_level_tokens)
+        #         class_text = ["A photo of {}.".format(cl) for cl in cl]
         for epoch in range(args.epochs):         
             train_stats = train_one_epoch(model=model, original_model=original_model, clip_model=clip_model, criterion=criterion, 
                                         data_loader=data_loader[task_id]['train'], optimizer=optimizer, 
                                         device=device, epoch=epoch, max_norm=args.clip_grad, 
-                                        set_training_mode=True, task_id=task_id, class_mask=class_mask, class_names=class_names, args=args,)
+                                        set_training_mode=True, task_id=task_id, class_mask=class_mask, class_names=class_names, args=args,task_level_features=task_level_feature)
             
             if lr_scheduler:
                 lr_scheduler.step(epoch)
+        
+        prompt_his.append(train_stats['prompt_ids'])
+        train_stats['prompt_ids'] = str(train_stats['prompt_ids'])
+        
         test_stats = evaluate_till_now(model=model, original_model=original_model, data_loader=data_loader, device=device, 
                                     task_id=task_id, class_mask=class_mask, acc_matrix=acc_matrix, args=args)
         if args.output_dir and utils.is_main_process():
@@ -339,3 +396,5 @@ def train_and_evaluate(model: torch.nn.Module, model_without_ddp: torch.nn.Modul
         if args.output_dir and utils.is_main_process():
             with open(os.path.join(args.output_dir, '{}_stats.txt'.format(datetime.datetime.now().strftime('log_%Y_%m_%d_%H_%M'))), 'a') as f:
                 f.write(json.dumps(log_stats) + '\n')
+                
+    prompt_visualization(prompt_his, range(10),'train_'+str(10))

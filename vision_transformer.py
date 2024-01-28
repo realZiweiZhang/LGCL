@@ -412,7 +412,8 @@ class VisionTransformer(nn.Module):
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
-
+            
+        self.project_into_same_space = nn.Linear(embed_dim,embed_dim)
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
@@ -470,18 +471,36 @@ class VisionTransformer(nn.Module):
                     prompt_mask = None
             else:
                 prompt_mask = None
+            
+            # x = self.project_into_same_space(x)
             res = self.prompt(x, prompt_mask=prompt_mask, cls_features=cls_features)
             self.total_prompt_len = res['total_prompt_len']
             x = res['prompted_embedding']
             
             if task_level_pos_text is not None and task_id > 0:
-                pos_loss = self.text_supervised_loss(res['selected_key'], task_level_pos_text) # (b n_prompt, c) (b c) ｜ 16 5
+                # projection
+                # projected_pos = self.project_into_same_space(task_level_pos_text.to(torch.float32))
+                source_subspace = torch.cat((task_level_pos_text.unsqueeze(0),task_level_neg_text),dim=0)
+                
+                # target_task_feature = torch.mean(res['x_embed_norm'].squeeze(),0)
+                # target_subspace = torch.zeros_like(source_subspace)
+                # target_subspace[0] = target_task_feature
+                
+                target_subspace = pca(res['x_embed_norm'].squeeze(),k=len(source_subspace))
+                projected_pos,projected_neg = subspace_align(source_subspace,target_subspace)
+                
+                pos_loss = self.text_supervised_loss(res['selected_key'], projected_pos.unsqueeze(0)) # (b n_prompt, c) (b c) ｜ 16 5
+                # pos_loss = res['selected_key']* projected_pos.unsqueeze(0)
                 print('pos task loss', torch.mean(pos_loss))
                 task_pos_loss = torch.sum(pos_loss) / (pos_loss.shape[0] * pos_loss.shape[1])
                 
                 neg_loss = 0
                 if task_level_neg_text is not None:
-                    neg_loss = self.text_supervised_loss(res['selected_key'], task_level_neg_text)
+                    # task_level_neg_text = self.project_into_same_space(task_level_neg_text.to(torch.float32))
+                    
+                    # neg_loss = self.text_supervised_loss(res['selected_key'], task_level_neg_text)
+                    neg_loss = self.text_supervised_loss(res['selected_key'].unsqueeze(2), projected_neg.unsqueeze(0).unsqueeze(0))
+                    # neg_loss = res['selected_key'].unsqueeze(2) * projected_neg.unsqueeze(0).unsqueeze(0) 
                     task_neg_loss = torch.sum(neg_loss) / (neg_loss.shape[0] * neg_loss.shape[1])
                     print('neg task loss', torch.mean(neg_loss))
 
@@ -550,11 +569,45 @@ class VisionTransformer(nn.Module):
         return res
     
     def text_supervised_loss(self, selected_key, text_feature):
-        if len(selected_key.shape) > 2:
+        if len(selected_key.shape) > len(text_feature.shape):
+        #if len(selected_key.shape) > 2 and :
             text_feature = text_feature.unsqueeze(1)
        # print(f'selected key: {selected_key.shape}, text_feature {text_feature.shape}')
         return F.cosine_similarity(selected_key,text_feature,dim=-1)
 
+def subspace_align(source_matrix, target_matrix):
+    # normalized
+    source_matrix, target_matrix = source_matrix.float(), target_matrix.float()
+    source_matrix = z_normalization(source_matrix)
+    target_matrix = z_normalization(target_matrix.T)
+    # target_matrix[1:,:]=0
+
+    # calculated inverse matrix
+    inv_source_mat = torch.linalg.pinv(source_matrix)
+    m = inv_source_mat @ target_matrix
+    
+    projected_matrix = source_matrix @ m
+    return projected_matrix[0],projected_matrix[1:]
+        
+def z_normalization(matrix):
+    z_mean = torch.mean(matrix,dim=1).unsqueeze(-1)
+    z_std = torch.std(matrix,dim=1).unsqueeze(-1)
+    
+    return (matrix-z_mean)/z_std        
+
+def pca(x,k=2):
+    x = x.T
+    x_mean = torch.mean(x,0)
+    x_centered = x - x_mean.expand_as(x)
+    
+    cov_matrix = torch.mm(x_centered.t(), x_centered) / (x.size(0) - 1)
+
+    u,s,v = torch.svd(cov_matrix)
+    top_k_eigenvector = v[:,:k]
+    
+    x_pca = torch.mm(x_centered,top_k_eigenvector)
+    return x_pca
+        
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """
     if isinstance(module, nn.Linear):
