@@ -482,11 +482,16 @@ class VisionTransformer(nn.Module):
                 # projected_pos = self.project_into_same_space(task_level_pos_text.to(torch.float32))
                 source_subspace = torch.cat((task_level_pos_text.unsqueeze(0),task_level_neg_text),dim=0)
                 
-                # target_task_feature = torch.mean(res['x_embed_norm'].squeeze(),0)
+                target_task_feature = torch.mean(res['x_embed_norm'].squeeze(),0)
                 # target_subspace = torch.zeros_like(source_subspace)
                 # target_subspace[0] = target_task_feature
+                target_subspace = target_task_feature.unsqueeze(0).repeat(len(source_subspace),1)
                 
-                target_subspace = pca(res['x_embed_norm'].squeeze(),k=len(source_subspace))
+                # target_subspace = pca(res['x_embed_norm'].squeeze(),k=len(source_subspace)).T
+                # if len(source_subspace) > len(target_subspace):
+                #     target_subspace_expand = torch.zeros_like(source_subspace)
+                #     target_subspace_expand[:len(target_subspace),:] = target_subspace
+
                 projected_pos,projected_neg = subspace_align(source_subspace,target_subspace)
                 
                 pos_loss = self.text_supervised_loss(res['selected_key'], projected_pos.unsqueeze(0)) # (b n_prompt, c) (b c) ｜ 16 5
@@ -578,35 +583,42 @@ class VisionTransformer(nn.Module):
 def subspace_align(source_matrix, target_matrix):
     # normalized
     source_matrix, target_matrix = source_matrix.float(), target_matrix.float()
-    source_matrix = z_normalization(source_matrix)
-    target_matrix = z_normalization(target_matrix.T)
+    source_matrix_norm = z_normalization(source_matrix,dim=1) # (d, D) | (d, D)
+    target_matrix_norm = z_normalization(target_matrix,dim=1)
+    
+    source_matrix_norm, target_matrix_norm = source_matrix_norm.T, target_matrix_norm.T # D, d
+    
+    target_matrix[torch.isnan(target_matrix)] = 0
+    # print('target', target_matrix)
+    source_matrix_pca = pca(source_matrix_norm,k=source_matrix_norm.shape[1]).to(source_matrix_norm.device)
+    target_matrix_pca = pca(target_matrix_norm,k=target_matrix_norm.shape[1]).to(target_matrix_norm.device) # D,d
+    # print(target_matrix_pca,target_matrix_pca.shape)
     # target_matrix[1:,:]=0
 
     # calculated inverse matrix
-    inv_source_mat = torch.linalg.pinv(source_matrix)
-    m = inv_source_mat @ target_matrix
+    inv_source_mat = torch.linalg.pinv(source_matrix_pca) # d, D.
+    m = inv_source_mat @ target_matrix_pca # d,d
+    # print('m',m)
     
-    projected_matrix = source_matrix @ m
+    projected_matrix = source_matrix.T @ m # D.d
+    projected_matrix = projected_matrix.T
     return projected_matrix[0],projected_matrix[1:]
         
-def z_normalization(matrix):
-    z_mean = torch.mean(matrix,dim=1).unsqueeze(-1)
-    z_std = torch.std(matrix,dim=1).unsqueeze(-1)
-    
+def z_normalization(matrix,dim=0):
+    z_mean = torch.mean(matrix,dim=dim).unsqueeze(-1)
+    z_std = torch.std(matrix,dim=dim).unsqueeze(-1)
     return (matrix-z_mean)/z_std        
 
 def pca(x,k=2):
-    x = x.T
+    # D, d
     x_mean = torch.mean(x,0)
     x_centered = x - x_mean.expand_as(x)
-    
-    cov_matrix = torch.mm(x_centered.t(), x_centered) / (x.size(0) - 1)
+    cov_matrix = torch.mm(x_centered.t(), x_centered) / (x.size(0) - 1) # d, d
 
     u,s,v = torch.svd(cov_matrix)
     top_k_eigenvector = v[:,:k]
-    
-    x_pca = torch.mm(x_centered,top_k_eigenvector)
-    return x_pca
+    # x_pca = torch.mm(x_centered,top_k_eigenvector) 
+    return top_k_eigenvector # D, k
         
 def init_weights_vit_timm(module: nn.Module, name: str = ''):
     """ ViT weight initialization, original timm impl (for reproducibility) """
